@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extrai metadados e resumos de PDFs num ZIP usando modelos multimodais da OpenAI."""
+"""Extrai metadados e resumos de PDFs e HTMLs num ZIP usando modelos multimodais da OpenAI."""
 
 import argparse
 import base64
@@ -11,19 +11,23 @@ import zipfile
 from pathlib import Path
 
 import fitz
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
 
 PAGES_PER_PART = 20
 IMG_DPI = 150
 TEXT_CHAR_THRESHOLD = 50
+HTML_CHARS_PER_PART = 20000
 
-EXTRACTION_PROMPT = """Você está analisando páginas de um documento (possivelmente do SEI - Sistema Eletrônico de Informações).
-Cada página vem rotulada como "(texto)" — texto extraído nativamente do PDF — ou "(imagem)" — página renderizada (provavelmente escaneada).
+SUPPORTED_SUFFIXES = {".pdf", ".html", ".htm"}
+
+EXTRACTION_PROMPT = """Você está analisando trechos de um documento (possivelmente do SEI - Sistema Eletrônico de Informações).
+Cada trecho vem rotulado como "(texto)" — texto extraído nativamente do documento (PDF ou HTML) — ou "(imagem)" — página renderizada (provavelmente escaneada).
 Examine cuidadosamente todo o conteúdo, incluindo cabeçalhos, rodapés, assinaturas e imagens.
 
 Extraia as seguintes informações:
-- resumo: resumo objetivo do conteúdo das páginas (3 a 6 frases, em português).
+- resumo: resumo objetivo do conteúdo dos trechos (3 a 6 frases, em português).
 - data: data principal do documento. Use o formato YYYY-MM-DD quando possível; caso a data esteja parcial, retorne como aparece. null se não houver.
 - autores: lista (array) de autores do documento (quem produziu o conteúdo). [] se não houver.
 - assinantes: lista (array) de quem assina o documento. [] se não houver.
@@ -68,6 +72,57 @@ def load_pdf_pages(pdf_path: Path, dpi: int = IMG_DPI) -> list[dict]:
     return pages
 
 
+def load_html_pages(html_path: Path, max_chars: int = HTML_CHARS_PER_PART) -> list[dict]:
+    """Extrai texto de um HTML e divide em 'páginas' por contagem de caracteres.
+
+    Mantém a mesma assinatura de `load_pdf_pages` para reaproveitar o pipeline:
+    retorna lista de dicts {numero, kind: "text", content: str}. Quebra em
+    parágrafos sempre que possível para evitar cortes no meio de frases.
+    """
+    soup = BeautifulSoup(html_path.read_bytes(), "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text("\n", strip=True)
+    # Colapsa linhas em branco repetidas, mantendo separadores de parágrafo.
+    lines = [line.strip() for line in text.splitlines()]
+    text = "\n".join(line for line in lines if line)
+    if not text:
+        return []
+
+    paragraphs = [p for p in text.split("\n\n") if p]
+    if not paragraphs:
+        paragraphs = [text]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for paragraph in paragraphs:
+        plen = len(paragraph) + 2  # "\n\n"
+        if current and current_len + plen > max_chars:
+            chunks.append("\n\n".join(current))
+            current, current_len = [paragraph], plen
+        else:
+            current.append(paragraph)
+            current_len += plen
+    if current:
+        chunks.append("\n\n".join(current))
+
+    return [
+        {"numero": i, "kind": "text", "content": chunk}
+        for i, chunk in enumerate(chunks, 1)
+    ]
+
+
+def load_pages(file_path: Path) -> list[dict]:
+    """Despacha para o loader correto com base na extensão do arquivo."""
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        return load_pdf_pages(file_path)
+    if suffix in {".html", ".htm"}:
+        return load_html_pages(file_path)
+    raise ValueError(f"Tipo de arquivo não suportado: {file_path.suffix}")
+
+
 def chunk_pages(pages: list[dict], size: int) -> list[list[dict]]:
     return [pages[i:i + size] for i in range(0, len(pages), size)]
 
@@ -83,10 +138,10 @@ def _build_page_blocks(pages: list[dict]) -> list[dict]:
         if p["kind"] == "text":
             blocks.append({
                 "type": "text",
-                "text": f"--- Página {p['numero']} (texto) ---\n{p['content']}",
+                "text": f"--- Trecho {p['numero']} (texto) ---\n{p['content']}",
             })
         else:
-            blocks.append({"type": "text", "text": f"--- Página {p['numero']} (imagem) ---"})
+            blocks.append({"type": "text", "text": f"--- Trecho {p['numero']} (imagem) ---"})
             blocks.append(_image_block(p["content"]))
     return blocks
 
@@ -130,24 +185,32 @@ def general_summary(client: OpenAI, model: str, docs: list[dict]) -> str:
     return resp.choices[0].message.content.strip()
 
 
-def process_document(client: OpenAI, model: str, pdf_path: Path, ordem: int, total: int) -> dict:
-    print(f"  [{ordem}/{total}] Processando: {pdf_path.name}")
-    pages = load_pdf_pages(pdf_path)
+def process_document(client: OpenAI, model: str, file_path: Path, ordem: int, total: int) -> dict:
+    tipo = "html" if file_path.suffix.lower() in {".html", ".htm"} else "pdf"
+    print(f"  [{ordem}/{total}] Processando ({tipo}): {file_path.name}")
+    pages = load_pages(file_path)
     n = len(pages)
     n_text = sum(1 for p in pages if p["kind"] == "text")
     n_img = n - n_text
-    print(f"        Páginas: {n} ({n_text} texto, {n_img} imagem)")
+    unidade = "trechos" if tipo == "html" else "páginas"
+    print(f"        {unidade.capitalize()}: {n} ({n_text} texto, {n_img} imagem)")
 
     entry: dict = {
         "ordem": ordem,
-        "nome": pdf_path.name,
+        "nome": file_path.name,
+        "tipo": tipo,
         "num_paginas": n,
         "paginas_texto": n_text,
         "paginas_imagem": n_img,
     }
 
+    if n == 0:
+        entry.update({"resumo": "", "data": None, "autores": [], "assinantes": [], "entidade": None})
+        print("        Aviso: nenhum conteúdo extraído.")
+        return entry
+
     if n <= PAGES_PER_PART:
-        info = extract_from_pages(client, model, pages, f"Documento '{pdf_path.name}', {n} página(s).")
+        info = extract_from_pages(client, model, pages, f"Documento '{file_path.name}' ({tipo}), {n} {unidade}.")
         entry.update(info)
         return entry
 
@@ -155,8 +218,8 @@ def process_document(client: OpenAI, model: str, pdf_path: Path, ordem: int, tot
     print(f"        Documento grande: dividido em {len(chunks)} partes")
     partes: list[dict] = []
     for i, chunk in enumerate(chunks, 1):
-        print(f"        Parte {i}/{len(chunks)} ({len(chunk)} páginas)")
-        ctx = f"Documento '{pdf_path.name}', parte {i} de {len(chunks)}."
+        print(f"        Parte {i}/{len(chunks)} ({len(chunk)} {unidade})")
+        ctx = f"Documento '{file_path.name}' ({tipo}), parte {i} de {len(chunks)}."
         info = extract_from_pages(client, model, chunk, ctx)
         partes.append({"parte": i, **info})
     consolidated = consolidate_parts(client, model, partes)
@@ -167,7 +230,7 @@ def process_document(client: OpenAI, model: str, pdf_path: Path, ordem: int, tot
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extrai resumos e metadados de PDFs num ZIP usando GPT multimodal."
+        description="Extrai resumos e metadados de PDFs e HTMLs num ZIP usando GPT multimodal."
     )
     parser.add_argument("zip_path", type=Path, help="Caminho para o arquivo .zip")
     parser.add_argument(
@@ -192,19 +255,24 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         with zipfile.ZipFile(args.zip_path) as zf:
-            pdfs = sorted(n for n in zf.namelist() if n.lower().endswith(".pdf"))
+            arquivos = sorted(
+                n for n in zf.namelist()
+                if Path(n).suffix.lower() in SUPPORTED_SUFFIXES
+            )
+            n_pdf = sum(1 for n in arquivos if n.lower().endswith(".pdf"))
+            n_html = len(arquivos) - n_pdf
             print(f"\n=== ZIP: {args.zip_path.name} ===")
-            print(f"Documentos encontrados: {len(pdfs)}")
-            for i, name in enumerate(pdfs, 1):
+            print(f"Documentos encontrados: {len(arquivos)} ({n_pdf} PDF, {n_html} HTML)")
+            for i, name in enumerate(arquivos, 1):
                 print(f"  {i}. {name}")
             print(f"Modelo: {model}\n")
-            if not pdfs:
-                sys.exit("Nenhum PDF encontrado no ZIP.")
+            if not arquivos:
+                sys.exit("Nenhum PDF ou HTML encontrado no ZIP.")
             zf.extractall(tmp_path)
 
         docs = [
-            process_document(client, model, tmp_path / name, i, len(pdfs))
-            for i, name in enumerate(pdfs, 1)
+            process_document(client, model, tmp_path / name, i, len(arquivos))
+            for i, name in enumerate(arquivos, 1)
         ]
 
     print("\nGerando resumo geral do conjunto...")
